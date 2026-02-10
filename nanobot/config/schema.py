@@ -189,11 +189,23 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    
+
+    # Runtime-only: the agent name that loaded this config (not persisted)
+    _agent_name: str = "default"
+
+    @property
+    def agent_name(self) -> str:
+        """Get the agent name associated with this config."""
+        return self._agent_name
+
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
-        return Path(self.agents.defaults.workspace).expanduser()
+        ws = self.agents.defaults.workspace
+        # If workspace is the old global default, rewrite to per-agent path
+        if ws == "~/.nanobot/workspace":
+            return Path.home() / ".nanobot" / self._agent_name / "workspace"
+        return Path(ws).expanduser()
     
     def _match_provider(self, model: str | None = None) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
