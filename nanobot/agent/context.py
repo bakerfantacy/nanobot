@@ -129,7 +129,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
+        prompt_extras: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -141,7 +141,8 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             media: Optional list of local file paths for images/media.
             channel: Current channel (telegram, feishu, etc.).
             chat_id: Current chat/user ID.
-            metadata: Optional channel metadata (e.g. group_bots for @mention).
+            prompt_extras: Optional scenario-specific text sections to
+                append to the system prompt (provided by MessageRouter).
 
         Returns:
             List of messages including system prompt.
@@ -153,33 +154,9 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
 
-        # Multi-agent group context: tell the agent about its peers
-        meta = metadata or {}
-        group_members = meta.get("group_members")
-        if group_members and isinstance(group_members, list):
-            member_lines = []
-            first_bot_name = None
-            for m in group_members:
-                name = m.get("name", "")
-                mtype = m.get("type", "bot")
-                desc = m.get("description", "")
-                label = f"@{name}"
-                if mtype == "bot":
-                    label += " (bot)"
-                    if not first_bot_name:
-                        first_bot_name = name
-                if desc:
-                    label += f" - {desc}"
-                member_lines.append(f"- {label}")
-            members_text = "\n".join(member_lines)
-            mention_hint = f" (e.g. @{first_bot_name})" if first_bot_name else ""
-            system_prompt += (
-                f"\n\n## Group Chat Members\n"
-                f"Other members in this group chat:\n{members_text}\n\n"
-                f"To @mention someone, write @name in your response{mention_hint}. "
-                f"Don't mention other bots if you are responding to a message from user, unless user allows you to do so."
-                f"The system will convert it to a proper @mention automatically."
-            )
+        # Scenario-specific prompt additions (e.g. group member list)
+        for extra in (prompt_extras or []):
+            system_prompt += extra
 
         messages.append({"role": "system", "content": system_prompt})
 
