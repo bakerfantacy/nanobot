@@ -25,17 +25,79 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     
-    def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
-        msg = {
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        sender_type: str | None = None,
+        sender: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Add a message to the session.
+
+        Args:
+            role: "user" or "assistant".
+            content: Message content.
+            sender_type: "human" | "bot" | None (None treated as human for backward compat).
+            sender: When sender_type="bot", the agent name or open_id.
+        """
+        msg: dict[str, Any] = {
             "role": role,
             "content": content,
             "timestamp": datetime.now().isoformat(),
-            **kwargs
+            **kwargs,
         }
+        if sender_type is not None:
+            msg["sender_type"] = sender_type
+        if sender is not None:
+            msg["sender"] = sender
         self.messages.append(msg)
         self.updated_at = datetime.now()
-    
+
+    def count_trailing_bots(self, max_scan: int = 30) -> int:
+        """
+        Count consecutive bot messages at the end of the session.
+        Used for bot-to-bot depth calculation.
+        Counts: assistant (self) + user with sender_type=="bot".
+        Stops at user with sender_type != "bot" (or missing, treated as human).
+        """
+        recent = self.messages[-max_scan:] if len(self.messages) > max_scan else self.messages
+        count = 0
+        for m in reversed(recent):
+            role = m.get("role", "")
+            sender_type = m.get("sender_type", "human")
+            if role == "assistant":
+                count += 1
+            elif role == "user" and sender_type == "bot":
+                count += 1
+            else:
+                break
+        return count
+
+    def get_recent_for_prompt(self, max_messages: int = 20) -> list[dict[str, Any]]:
+        """
+        Get recent messages in transcript-like format for prompts.
+        Returns [{role, content, sender}] compatible with transcript.get_recent.
+        assistant (self) -> role=assistant, sender="self"
+        user+sender_type=bot -> role=assistant, sender=agent_name
+        user+human/system -> role=user, sender=""
+        """
+        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
+        result: list[dict[str, Any]] = []
+        for m in recent:
+            role = m.get("role", "")
+            content = m.get("content", "")
+            sender_type = m.get("sender_type", "human")
+            sender = m.get("sender", "")
+            if role == "assistant":
+                result.append({"role": "assistant", "content": content, "sender": "self"})
+            elif role == "user" and sender_type == "bot":
+                result.append({"role": "assistant", "content": content, "sender": sender})
+            else:
+                result.append({"role": "user", "content": content, "sender": ""})
+        return result
+
     def get_history(self, max_messages: int = 50) -> list[dict[str, Any]]:
         """
         Get message history for LLM context.

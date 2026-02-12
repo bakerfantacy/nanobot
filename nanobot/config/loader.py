@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, GroupMember
 
 DEFAULT_AGENT_NAME = "default"
 
@@ -56,6 +56,43 @@ def list_agents() -> list[str]:
         if child.is_dir() and (child / "config.json").exists():
             agents.append(child.name)
     return agents
+
+
+def get_groups_path() -> Path:
+    """Get the shared groups configuration file path (~/.nanobot/groups.json)."""
+    return get_nanobot_home() / "groups.json"
+
+
+def load_groups() -> list[GroupMember]:
+    """
+    Load group member definitions from ~/.nanobot/groups.json.
+
+    The file is a flat JSON array of member objects, each with
+    name, open_id, type, and description.
+
+    Returns:
+        List of GroupMember (empty list if file missing or invalid).
+    """
+    path = get_groups_path()
+    if not path.exists():
+        return []
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Warning: Failed to load groups from {path}: {e}")
+        return []
+
+    if not isinstance(raw, list):
+        print(f"Warning: groups.json should be a JSON array, got {type(raw).__name__}")
+        return []
+
+    members: list[GroupMember] = []
+    for m in raw:
+        if isinstance(m, dict):
+            members.append(GroupMember.model_validate(convert_keys(m)))
+    return members
 
 
 def load_config(

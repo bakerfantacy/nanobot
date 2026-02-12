@@ -11,8 +11,10 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
+from nanobot.transcript.store import GroupTranscriptStore
 
 if TYPE_CHECKING:
+    from nanobot.relay.backend import GroupMessageRelay
     from nanobot.session.manager import SessionManager
 
 
@@ -26,13 +28,22 @@ class ChannelManager:
     - Route outbound messages
     """
     
-    def __init__(self, config: Config, bus: MessageBus, session_manager: "SessionManager | None" = None):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        session_manager: "SessionManager | None" = None,
+        transcript_store: GroupTranscriptStore | None = None,
+        relay: "GroupMessageRelay | None" = None,
+    ):
         self.config = config
         self.bus = bus
         self.session_manager = session_manager
+        self.transcript_store = transcript_store or GroupTranscriptStore()
+        self.relay = relay
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
-        
+
         self._init_channels()
     
     def _init_channels(self) -> None:
@@ -79,7 +90,9 @@ class ChannelManager:
             try:
                 from nanobot.channels.feishu import FeishuChannel
                 self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus
+                    self.config.channels.feishu,
+                    self.bus,
+                    transcript_store=self.transcript_store,
                 )
                 logger.info("Feishu channel enabled")
             except ImportError as e:
@@ -190,6 +203,33 @@ class ChannelManager:
                 if channel:
                     try:
                         await channel.send(msg)
+                        if msg.channel == "feishu" and (msg.metadata or {}).get("chat_type") == "group":
+                            if self.transcript_store:
+                                try:
+                                    session_key = f"feishu:{msg.chat_id}"
+                                    self.transcript_store.append(
+                                        session_key,
+                                        role="assistant",
+                                        content=msg.content,
+                                        sender=self.config.agent_name,
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"Failed to append outbound to transcript: {e}")
+                            if self.relay:
+                                feishu_ch = self.channels.get("feishu")
+                                bot_open_id = getattr(feishu_ch, "bot_open_id", None) if feishu_ch else None
+                                if bot_open_id:
+                                    try:
+                                        self.relay.publish(
+                                            channel=msg.channel,
+                                            chat_id=msg.chat_id,
+                                            content=msg.content,
+                                            sender_bot_open_id=bot_open_id,
+                                            sender_agent_name=self.config.agent_name,
+                                            metadata=msg.metadata or {},
+                                        )
+                                    except Exception as e:
+                                        logger.debug(f"Failed to relay publish: {e}")
                     except Exception as e:
                         logger.error(f"Error sending to {msg.channel}: {e}")
                 else:

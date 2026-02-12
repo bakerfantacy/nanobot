@@ -368,11 +368,21 @@ def gateway(
     sessions_dir = data_dir / "sessions"
     session_manager = SessionManager(config.workspace_path, sessions_dir=sessions_dir)
 
+    # Multi-agent relay: transcript_store and relay when Feishu is enabled
+    transcript_store = None
+    relay = None
+    if config.channels.feishu.enabled:
+        from nanobot.transcript.store import GroupTranscriptStore
+        from nanobot.relay.backend import GroupMessageRelay
+        transcript_store = GroupTranscriptStore()
+        relay = GroupMessageRelay()
+
     # Create cron service first (callback set after agent creation)
     cron_store_path = data_dir / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
+    feishu_config = config.channels.feishu
     agent = AgentLoop(
         bus=bus,
         provider=provider,
@@ -384,6 +394,9 @@ def gateway(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
+        max_bot_reply_depth=feishu_config.max_bot_reply_depth,
+        bot_reply_llm_threshold=feishu_config.bot_reply_llm_threshold,
+        bot_reply_llm_check=feishu_config.bot_reply_llm_check,
     )
 
     # Set cron callback (needs agent)
@@ -417,13 +430,36 @@ def gateway(
         enabled=True
     )
 
-    # Create channel manager
-    channels = ChannelManager(config, bus, session_manager=session_manager)
+    # Create channel manager (with transcript_store and relay for multi-agent Feishu)
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        transcript_store=transcript_store,
+        relay=relay,
+    )
+
+    # Create relay subscriber when Feishu + relay enabled
+    subscriber = None
+    if relay and transcript_store:
+        from nanobot.relay.subscriber import RelaySubscriber
+        subscriber = RelaySubscriber(
+            relay=relay,
+            bus=bus,
+            transcript_store=transcript_store,
+            bot_open_id=None,
+            agent_name=name,
+            get_bot_open_id=lambda: getattr(channels.get_channel("feishu"), "bot_open_id", None)
+            if channels.get_channel("feishu") else None,
+        )
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
+
+    if relay and subscriber:
+        console.print("[green]✓[/green] Multi-agent relay: enabled (group chat)")
 
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
@@ -432,18 +468,28 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
 
     async def run():
+        await cron.start()
+        await heartbeat.start()
+        tasks = [agent.run(), channels.start_all()]
+        subscriber_task = None
+        if subscriber:
+            subscriber_task = asyncio.create_task(subscriber.run())
+            tasks.append(subscriber_task)
         try:
-            await cron.start()
-            await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
             heartbeat.stop()
             cron.stop()
             agent.stop()
+            if subscriber:
+                subscriber.stop()
+                if subscriber_task:
+                    subscriber_task.cancel()
+                    try:
+                        await subscriber_task
+                    except asyncio.CancelledError:
+                        pass
             await channels.stop_all()
 
     asyncio.run(run())

@@ -5,6 +5,19 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 
+# ---------------------------------------------------------------------------
+# Shared group member schema (loaded from ~/.nanobot/groups.json)
+# ---------------------------------------------------------------------------
+
+
+class GroupMember(BaseModel):
+    """A member (bot or user) in a group chat."""
+    name: str  # Display name
+    feishu_open_id: str = ""  # Feishu open_id (ou_xxx)
+    type: str = "bot"  # "bot" or "user"
+    description: str = ""  # Personality / capability description
+
+
 class WhatsAppConfig(BaseModel):
     """WhatsApp channel configuration."""
     enabled: bool = False
@@ -28,6 +41,11 @@ class FeishuConfig(BaseModel):
     encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
+    group_policy: str = "auto"  # "mention": only respond when @mentioned; "auto": LLM relevance check; "open": respond to all
+    # Bot-to-bot reply control
+    max_bot_reply_depth: int = 8  # Max consecutive bot reply rounds; reject when exceeded
+    bot_reply_llm_threshold: int = 3  # Call LLM only when depth > this and < max
+    bot_reply_llm_check: bool = True  # Whether to use LLM semantic judgment
 
 
 class DingTalkConfig(BaseModel):
