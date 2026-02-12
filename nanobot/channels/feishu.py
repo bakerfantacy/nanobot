@@ -19,8 +19,8 @@ from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import FeishuConfig
 
 try:
-    import lark_oapi as lark
-    from lark_oapi.api.im.v1 import (
+    import lark_oapi as lark  # pyright: ignore[reportMissingImports]
+    from lark_oapi.api.im.v1 import (  # pyright: ignore[reportMissingImports]
         CreateMessageRequest,
         CreateMessageRequestBody,
         CreateMessageReactionRequest,

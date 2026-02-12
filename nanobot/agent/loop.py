@@ -9,6 +9,8 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ExecToolConfig
+from nanobot.cron.service import CronService
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
@@ -178,6 +180,7 @@ class AgentLoop:
         # policy=auto, or from_bot (relay-injected): need LLM judgment
         # Bot-to-bot: depth hard limit first
         from_bot = meta.get("from_bot", False)
+        logger.debug(f"judge by rules...")
         logger.debug(f"is bot？: {from_bot}")
 
         policy = meta.get("group_policy", "open")
