@@ -10,31 +10,40 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
-def get_data_path() -> Path:
-    """Get the nanobot data directory (~/.nanobot)."""
+def get_nanobot_home() -> Path:
+    """Get the nanobot home directory (~/.nanobot)."""
     return ensure_dir(Path.home() / ".nanobot")
 
 
-def get_workspace_path(workspace: str | None = None) -> Path:
+def get_data_path(agent_name: str = "default") -> Path:
+    """Get the nanobot data directory for a specific agent (~/.nanobot/<agent_name>)."""
+    return ensure_dir(Path.home() / ".nanobot" / agent_name)
+
+
+def get_workspace_path(
+    workspace: str | None = None,
+    agent_name: str = "default",
+) -> Path:
     """
     Get the workspace path.
-    
+
     Args:
-        workspace: Optional workspace path. Defaults to ~/.nanobot/workspace.
-    
+        workspace: Optional explicit workspace path override.
+        agent_name: Agent name. Defaults to "default".
+
     Returns:
         Expanded and ensured workspace path.
     """
     if workspace:
         path = Path(workspace).expanduser()
     else:
-        path = Path.home() / ".nanobot" / "workspace"
+        path = Path.home() / ".nanobot" / agent_name / "workspace"
     return ensure_dir(path)
 
 
-def get_sessions_path() -> Path:
-    """Get the sessions storage directory."""
-    return ensure_dir(get_data_path() / "sessions")
+def get_sessions_path(agent_name: str = "default") -> Path:
+    """Get the sessions storage directory for a specific agent."""
+    return ensure_dir(get_data_path(agent_name) / "sessions")
 
 
 def get_skills_path(workspace: Path | None = None) -> Path:
@@ -67,10 +76,10 @@ def safe_filename(name: str) -> str:
 def parse_session_key(key: str) -> tuple[str, str]:
     """
     Parse a session key into channel and chat_id.
-    
+
     Args:
         key: Session key in format "channel:chat_id"
-    
+
     Returns:
         Tuple of (channel, chat_id)
     """

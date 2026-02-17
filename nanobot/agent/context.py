@@ -105,9 +105,15 @@ IMPORTANT: When responding to direct questions or conversations, reply directly 
 Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 For normal conversation, just respond with text - do not call the message tool.
 
-Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
-When remembering something important, write to {workspace_path}/memory/MEMORY.md
-To recall past events, grep {workspace_path}/memory/HISTORY.md"""
+## Reply style (strict)
+- Be brief: one short paragraph or 1–3 sentences for most questions. Only go longer if the user clearly needs detail.
+- No AI fluff: avoid "好的"、"当然"、"很高兴为您"、"让我来"、"总结一下" and long bullet lists. Say the thing directly.
+- Sound human: casual, natural language like chatting with a friend. No "首先/其次/综上所述" unless the topic really needs it.
+- No reasoning in the reply: give the conclusion only. Do not show thinking or step-by-step unless asked.
+- Tools: one short line of what you're doing. When remembering, write to {workspace_path}/memory/MEMORY.md
+Don’t show your reasoning or write long explanations unless the user asks for them.
+When using tools, explain what you're doing.
+When remembering something, write to {workspace_path}/memory/MEMORY.md"""
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -129,6 +135,8 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        prompt_extras: list[str] | None = None,
+        user_reminders: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -140,6 +148,10 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
             media: Optional list of local file paths for images/media.
             channel: Current channel (telegram, feishu, etc.).
             chat_id: Current chat/user ID.
+            prompt_extras: Optional scenario-specific text sections to
+                append to the system prompt (provided by MessageRouter).
+            user_reminders: Optional short reminders prepended to the user
+                message for maximum LLM attention (provided by MessageRouter).
 
         Returns:
             List of messages including system prompt.
@@ -150,13 +162,24 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         system_prompt = self.build_system_prompt(skill_names)
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
+
+        # Scenario-specific prompt additions (e.g. group member list)
+        for extra in (prompt_extras or []):
+            system_prompt += extra
+
         messages.append({"role": "system", "content": system_prompt})
 
         # History
         messages.extend(history)
 
+        # Prepend reminders to user message for highest salience
+        effective_message = current_message
+        if user_reminders:
+            reminder_block = "\n".join(user_reminders)
+            effective_message = f"{reminder_block}\n\n{current_message}"
+
         # Current message (with optional image attachments)
-        user_content = self._build_user_content(current_message, media)
+        user_content = self._build_user_content(effective_message, media)
         messages.append({"role": "user", "content": user_content})
 
         return messages

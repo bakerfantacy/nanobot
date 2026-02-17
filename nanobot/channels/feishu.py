@@ -4,8 +4,12 @@ import asyncio
 import json
 import re
 import threading
+import time
 from collections import OrderedDict
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from nanobot.transcript.store import GroupTranscriptStore
 
 from loguru import logger
 
@@ -15,8 +19,8 @@ from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import FeishuConfig
 
 try:
-    import lark_oapi as lark
-    from lark_oapi.api.im.v1 import (
+    import lark_oapi as lark  # pyright: ignore[reportMissingImports]
+    from lark_oapi.api.im.v1 import (  # pyright: ignore[reportMissingImports]
         CreateMessageRequest,
         CreateMessageRequestBody,
         CreateMessageReactionRequest,
@@ -100,14 +104,24 @@ class FeishuChannel(BaseChannel):
     
     name = "feishu"
     
-    def __init__(self, config: FeishuConfig, bus: MessageBus):
+    def __init__(
+        self,
+        config: FeishuConfig,
+        bus: MessageBus,
+        transcript_store: "GroupTranscriptStore | None" = None,
+    ):
         super().__init__(config, bus)
         self.config: FeishuConfig = config
+        self._transcript_store = transcript_store
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._bot_open_id: str | None = None  # This bot's own open_id (fetched at startup)
+        self._started_at_ms: float = 0  # Agent start time (ms), used to ignore replayed historical events
+        self._group_members: list = []  # GroupMember list from shared groups.json
+        self._name_to_open_id: dict[str, str] = {}  # display_name → open_id (for outbound @mention)
     
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -128,7 +142,17 @@ class FeishuChannel(BaseChannel):
             .app_secret(self.config.app_secret) \
             .log_level(lark.LogLevel.INFO) \
             .build()
-        
+
+        # Fetch this bot's own open_id for self-message detection and @mention matching
+        self._bot_open_id = await self._fetch_bot_open_id()
+        if self._bot_open_id:
+            logger.info(f"Feishu bot open_id: {self._bot_open_id}")
+        else:
+            logger.warning("Could not fetch bot open_id; self-skip and @mention detection disabled")
+
+        # Load shared group member registry from ~/.nanobot/groups.json
+        self._load_group_members()
+
         # Create event handler (only register message receive, ignore other events)
         event_handler = lark.EventDispatcherHandler.builder(
             self.config.encrypt_key or "",
@@ -158,13 +182,20 @@ class FeishuChannel(BaseChannel):
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
         self._ws_thread.start()
         
+        # Record start time to ignore replayed historical events (Feishu may push old messages on connect)
+        self._started_at_ms = time.time() * 1000
+        
         logger.info("Feishu bot started with WebSocket long connection")
         logger.info("No public IP required - using WebSocket to receive events")
-        
-        # Keep running until stopped
+
         while self._running:
             await asyncio.sleep(1)
-    
+
+    @property
+    def bot_open_id(self) -> str | None:
+        """This bot's Feishu open_id (for relay publish)."""
+        return self._bot_open_id
+
     async def stop(self) -> None:
         """Stop the Feishu bot."""
         self._running = False
@@ -174,7 +205,82 @@ class FeishuChannel(BaseChannel):
             except Exception as e:
                 logger.warning(f"Error stopping WebSocket client: {e}")
         logger.info("Feishu bot stopped")
-    
+
+    async def _fetch_bot_open_id(self, retries: int = 3, delay: float = 2.0) -> str | None:
+        """
+        Fetch this bot's own open_id via GET /open-apis/bot/v3/info.
+
+        Obtains a tenant_access_token first, then queries the bot info API.
+        Retries on failure.
+
+        Returns:
+            The bot's open_id, or None on failure.
+        """
+        import httpx
+
+        for attempt in range(1, retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=10) as http:
+                    # Step 1: get tenant_access_token
+                    token_resp = await http.post(
+                        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                        json={"app_id": self.config.app_id, "app_secret": self.config.app_secret},
+                    )
+                    token_data = token_resp.json()
+                    token = token_data.get("tenant_access_token")
+                    if not token:
+                        logger.warning(
+                            f"[attempt {attempt}/{retries}] Could not obtain tenant_access_token: "
+                            f"{token_data}"
+                        )
+                        if attempt < retries:
+                            await asyncio.sleep(delay)
+                        continue
+
+                    # Step 2: get bot info
+                    resp = await http.get(
+                        "https://open.feishu.cn/open-apis/bot/v3/info",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        open_id = data.get("bot", {}).get("open_id")
+                        if open_id:
+                            return open_id
+                        logger.warning(f"[attempt {attempt}/{retries}] Bot info response missing open_id: {data}")
+                    else:
+                        logger.warning(
+                            f"[attempt {attempt}/{retries}] Fetch bot info failed: "
+                            f"status={resp.status_code}, body={resp.text[:200]}"
+                        )
+            except Exception as e:
+                logger.warning(f"[attempt {attempt}/{retries}] Error fetching bot info: {e}")
+
+            if attempt < retries:
+                await asyncio.sleep(delay)
+
+        return None
+
+    def _load_group_members(self) -> None:
+        """Load group members from ~/.nanobot/groups.json."""
+        try:
+            from nanobot.config.loader import load_groups
+            members = load_groups()
+            self._group_members = members
+            # Build name → open_id mapping, excluding self
+            self._name_to_open_id = {
+                m.name: m.feishu_open_id
+                for m in members
+                if m.feishu_open_id and m.feishu_open_id != self._bot_open_id
+            }
+            if members:
+                logger.info(
+                    f"Loaded {len(members)} group members from groups.json: "
+                    f"{', '.join(m.name for m in members)}"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load group members: {e}")
+
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
         try:
@@ -284,6 +390,20 @@ class FeishuChannel(BaseChannel):
 
         return elements or [{"tag": "markdown", "content": content}]
 
+    def _resolve_outbound_mentions(self, text: str) -> str:
+        """
+        Convert @Name patterns in outgoing text to Feishu's interactive card
+        @mention syntax: ``<at id=ou_xxx></at>``.
+
+        Resolves names from the shared groups.json registry.
+        """
+        if not self._name_to_open_id:
+            return text
+        for display_name, open_id in self._name_to_open_id.items():
+            pattern = re.compile(rf"@{re.escape(display_name)}", re.IGNORECASE)
+            text = pattern.sub(f"<at id={open_id}></at>", text)
+        return text
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu."""
         if not self._client:
@@ -297,9 +417,12 @@ class FeishuChannel(BaseChannel):
                 receive_id_type = "chat_id"
             else:
                 receive_id_type = "open_id"
-            
+
+            # Resolve @BotName → Feishu <at> syntax before building card
+            resolved_content = self._resolve_outbound_mentions(msg.content)
+
             # Build card with markdown + table support
-            elements = self._build_card_elements(msg.content)
+            elements = self._build_card_elements(resolved_content)
             card = {
                 "config": {"wide_screen_mode": True},
                 "elements": elements,
@@ -337,38 +460,128 @@ class FeishuChannel(BaseChannel):
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
     
+    # Regex to strip @mention placeholders like @_user_1 from text
+    _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
+
     async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
-        """Handle incoming message from Feishu."""
+        """Handle incoming message from Feishu with multi-agent routing."""
         try:
             event = data.event
             message = event.message
             sender = event.sender
-            
+
             # Deduplication check
             message_id = message.message_id
             if message_id in self._processed_message_ids:
                 return
             self._processed_message_ids[message_id] = None
-            
+
             # Trim cache: keep most recent 500 when exceeds 1000
             while len(self._processed_message_ids) > 1000:
                 self._processed_message_ids.popitem(last=False)
-            
-            # Skip bot messages
-            sender_type = sender.sender_type
-            if sender_type == "bot":
-                return
-            
+
             sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
+
+            # ----------------------------------------------------------
+            # Self-sent check: skip messages from this bot itself
+            # ----------------------------------------------------------
+            if self._bot_open_id and sender_id == self._bot_open_id:
+                logger.debug(f"Skipping self-sent message {message_id}")
+                return
+
+            # ----------------------------------------------------------
+            # Ignore replayed historical events (Feishu may push old messages when WebSocket connects)
+            # ----------------------------------------------------------
+            create_time = getattr(message, "create_time", None) or getattr(event, "create_time", None)
+            if create_time is not None and self._started_at_ms > 0:
+                try:
+                    msg_ts = int(create_time) if isinstance(create_time, str) else create_time
+                    # Allow 60s buffer for clock skew; only process messages created after agent start
+                    if msg_ts < self._started_at_ms - 60_000:
+                        logger.debug(
+                            f"Skipping replayed historical message {message_id} "
+                            f"(create_time={msg_ts}, started_at={self._started_at_ms:.0f})"
+                        )
+                        return
+                except (ValueError, TypeError):
+                    pass
+
             chat_id = message.chat_id
             chat_type = message.chat_type  # "p2p" or "group"
             msg_type = message.message_type
-            
-            # Add reaction to indicate "seen"
-            await self._add_reaction(message_id, "THUMBSUP")
-            
-            # Parse message content
+
+            # ----------------------------------------------------------
+            # Parse @mentions
+            # ----------------------------------------------------------
+            mentions = getattr(message, "mentions", None) or []
+            mentioned_ids: set[str] = set()
+            mention_names: dict[str, str] = {}  # placeholder → display name
+            our_mention_key: str | None = None  # placeholder for this bot (e.g. _user_1)
+            for m in mentions:
+                # m.id is typically a UserId object with .open_id; fall back to str
+                m_id_obj = getattr(m, "id", None)
+                open_id = getattr(m_id_obj, "open_id", None) if m_id_obj else None
+                if not open_id and isinstance(m_id_obj, str):
+                    open_id = m_id_obj
+                if open_id:
+                    mentioned_ids.add(open_id)
+                key = getattr(m, "key", "")
+                name = getattr(m, "name", "")
+                if key and name:
+                    mention_names[key] = name
+                if open_id and open_id == self._bot_open_id and key:
+                    our_mention_key = key
+
+            # Require explicit @ in message text. Feishu can add us to mentions
+            # when user "replies" to our message without typing @us; only treat
+            # as mentioned when the message body actually contains a mention of us.
+            raw_text = ""
             if msg_type == "text":
+                try:
+                    raw_text = json.loads(message.content).get("text", "") or ""
+                except (json.JSONDecodeError, AttributeError):
+                    raw_text = getattr(message, "content", "") or ""
+            # Only treat as mentioned when our placeholder appears in message text
+            # (e.g. @_user_1 or _user_1). Do not trust mentions list alone for *text*
+            # messages. For non-text messages (e.g. image-only), there is no text body
+            # to contain the placeholder; if we are in mentions and have our_mention_key,
+            # the user did @ us, so treat as mentioned.
+            if msg_type == "text":
+                in_text = bool(
+                    our_mention_key
+                    and raw_text
+                    and (our_mention_key in raw_text or f"@{our_mention_key}" in raw_text)
+                )
+            else:
+                in_text = bool(our_mention_key and self._bot_open_id and self._bot_open_id in mentioned_ids)
+            is_mentioned = bool(self._bot_open_id and self._bot_open_id in mentioned_ids and in_text)
+            if chat_type == "group" and self._bot_open_id:
+                logger.debug(
+                    f"is_mentioned: in_list={self._bot_open_id in mentioned_ids} "
+                    f"our_key={our_mention_key!r} in_text={in_text} => {is_mentioned}"
+                )
+
+            # ----------------------------------------------------------
+            # Group routing (applies to all senders: user or other bot)
+            # ----------------------------------------------------------
+            if chat_type == "group" and not is_mentioned:
+                policy = self.config.group_policy
+                if policy == "mention":
+                    # Strict mention-only mode: skip non-mentioned messages
+                    logger.debug(
+                        f"Skipping non-mentioned group message {message_id} (policy=mention)"
+                    )
+                    return
+                # "auto" and "open" pass through; "auto" will be checked by AgentLoop
+
+            # Add reaction to indicate "seen" (only for messages we will process)
+            await self._add_reaction(message_id, "THUMBSUP")
+
+            # ----------------------------------------------------------
+            # Parse message content
+            # ----------------------------------------------------------
+            if msg_type == "text":
+                content = raw_text if raw_text else ""
                 try:
                     content = json.loads(message.content).get("text", "")
                 except json.JSONDecodeError:
@@ -381,22 +594,58 @@ class FeishuChannel(BaseChannel):
                     content = message.content or ""
             else:
                 content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
-            
+
             if not content:
                 return
-            
-            # Forward to message bus
+
+            # Clean @mention placeholders from text, replace with display names
+            for placeholder, display_name in mention_names.items():
+                content = content.replace(placeholder, f"@{display_name}")
+            # Remove any remaining unresolved placeholders
+            content = self._MENTION_PLACEHOLDER_RE.sub("", content).strip()
+
+            if not content:
+                return
+
+            # Append to shared transcript (for multi-agent context)
+            if chat_type == "group" and self._transcript_store:
+                session_key = f"feishu:{chat_id}"
+                try:
+                    self._transcript_store.append(
+                        session_key,
+                        role="user",
+                        content=content,
+                        sender=sender_id,
+                        message_id=message_id,
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to append inbound to transcript: {e}")
+
+            # ----------------------------------------------------------
+            # Forward to message bus with routing metadata
+            # ----------------------------------------------------------
             reply_to = chat_id if chat_type == "group" else sender_id
+            metadata: dict[str, Any] = {
+                "message_id": message_id,
+                "chat_type": chat_type,
+                "msg_type": msg_type,
+                "is_mentioned": is_mentioned,
+                "group_policy": self.config.group_policy,
+            }
+            # Pass group member registry so the agent knows its peers
+            if self._group_members:
+                metadata["group_members"] = [
+                    {"name": m.name, "type": m.type, "description": m.description}
+                    for m in self._group_members
+                    if m.feishu_open_id != self._bot_open_id  # exclude self
+                ]
+
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
                 content=content,
-                metadata={
-                    "message_id": message_id,
-                    "chat_type": chat_type,
-                    "msg_type": msg_type,
-                }
+                metadata=metadata,
             )
-            
+
         except Exception as e:
             logger.error(f"Error processing Feishu message: {e}")

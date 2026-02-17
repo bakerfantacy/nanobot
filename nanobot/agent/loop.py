@@ -11,6 +11,8 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ExecToolConfig
+from nanobot.cron.service import CronService
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
@@ -22,7 +24,9 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.routing import MessageRouter, GroupChatFilter
 from nanobot.session.manager import Session, SessionManager
+
 
 
 class AgentLoop:
@@ -53,6 +57,9 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
+        max_bot_reply_depth: int = 8,
+        bot_reply_llm_threshold: int = 3,
+        bot_reply_llm_check: bool = True,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -72,6 +79,17 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+
+        # Message routing (scenario-specific response filters)
+        self.router = MessageRouter()
+        self.router.add_filter(GroupChatFilter(
+            provider=provider,
+            model=self.model,
+            workspace=workspace,
+            max_bot_reply_depth=max_bot_reply_depth,
+            bot_reply_llm_threshold=bot_reply_llm_threshold,
+            bot_reply_llm_check=bot_reply_llm_check,
+        ))
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -146,7 +164,7 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+    async def _run_agent_loop(self, msg: list[dict]) -> tuple[str | None, list[str]]:
         """
         Run the agent iteration loop.
 
@@ -156,7 +174,54 @@ class AgentLoop:
         Returns:
             Tuple of (final_content, list_of_tools_used).
         """
-        messages = initial_messages
+        # Handle system messages (subagent announces)
+        # The chat_id contains the original "channel:chat_id" to route back to
+        if msg.channel == "system":
+            return await self._process_system_message(msg)
+
+        # Get or create session early (needed for relevance check when using group_policy=auto)
+        session = self.sessions.get_or_create(msg.session_key)
+
+        # Message routing: check if this agent should respond
+        if not await self.router.should_respond(msg, session):
+            logger.info(
+                f"Skipping message from {msg.channel}:{msg.sender_id} "
+                f"(not relevant / not mentioned)"
+            )
+            return None
+
+        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
+        
+        # Update tool contexts
+        message_tool = self.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            message_tool.set_context(msg.channel, msg.chat_id)
+        
+        spawn_tool = self.tools.get("spawn")
+        if isinstance(spawn_tool, SpawnTool):
+            spawn_tool.set_context(msg.channel, msg.chat_id)
+        
+        cron_tool = self.tools.get("cron")
+        if isinstance(cron_tool, CronTool):
+            cron_tool.set_context(msg.channel, msg.chat_id)
+        
+        # Collect scenario-specific additions from routing filters
+        prompt_extras = self.router.collect_prompt_extras(msg, session)
+        user_reminders = self.router.collect_user_reminders(msg, session)
+
+        # Build initial messages (use get_history for LLM-formatted messages)
+        messages = self.context.build_messages(
+            history=session.get_history(),
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            prompt_extras=prompt_extras,
+            user_reminders=user_reminders,
+        )
+        
+        # Agent loop
         iteration = 0
         final_content = None
         tools_used: list[str] = []
@@ -305,9 +370,18 @@ class AgentLoop:
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
         
-        session.add_message("user", msg.content)
-        session.add_message("assistant", final_content,
-                            tools_used=tools_used if tools_used else None)
+        # Save to session (distinguish human vs other bot for depth calculation)
+        meta = msg.metadata or {}
+        if meta.get("from_bot"):
+            session.add_message(
+                "user",
+                msg.content,
+                sender_type="bot",
+                sender=meta.get("sender_agent_name") or msg.sender_id,
+            )
+        else:
+            session.add_message("user", msg.content, sender_type="human")
+        session.add_message("assistant", final_content)
         self.sessions.save(session)
         
         return OutboundMessage(
@@ -350,7 +424,12 @@ class AgentLoop:
         if final_content is None:
             final_content = "Background task completed."
         
-        session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
+        # Save to session (mark as system message in history)
+        session.add_message(
+            "user",
+            f"[System: {msg.sender_id}] {msg.content}",
+            sender_type="system",
+        )
         session.add_message("assistant", final_content)
         self.sessions.save(session)
         

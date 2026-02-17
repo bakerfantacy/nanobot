@@ -5,6 +5,19 @@ from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings
 
 
+# ---------------------------------------------------------------------------
+# Shared group member schema (loaded from ~/.nanobot/groups.json)
+# ---------------------------------------------------------------------------
+
+
+class GroupMember(BaseModel):
+    """A member (bot or user) in a group chat."""
+    name: str  # Display name
+    feishu_open_id: str = ""  # Feishu open_id (ou_xxx)
+    type: str = "bot"  # "bot" or "user"
+    description: str = ""  # Personality / capability description
+
+
 class WhatsAppConfig(BaseModel):
     """WhatsApp channel configuration."""
     enabled: bool = False
@@ -29,6 +42,11 @@ class FeishuConfig(BaseModel):
     encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
+    group_policy: str = "auto"  # "mention": only respond when @mentioned; "auto": LLM relevance check; "open": respond to all
+    # Bot-to-bot reply control
+    max_bot_reply_depth: int = 8  # Max consecutive bot reply rounds; reject when exceeded
+    bot_reply_llm_threshold: int = 3  # Call LLM only when depth > this and < max
+    bot_reply_llm_check: bool = True  # Whether to use LLM semantic judgment
 
 
 class DingTalkConfig(BaseModel):
@@ -240,11 +258,23 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    
+
+    # Runtime-only: the agent name that loaded this config (not persisted)
+    _agent_name: str = "default"
+
+    @property
+    def agent_name(self) -> str:
+        """Get the agent name associated with this config."""
+        return self._agent_name
+
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
-        return Path(self.agents.defaults.workspace).expanduser()
+        ws = self.agents.defaults.workspace
+        # If workspace is the old global default, rewrite to per-agent path
+        if ws == "~/.nanobot/workspace":
+            return Path.home() / ".nanobot" / self._agent_name / "workspace"
+        return Path(ws).expanduser()
     
     def _match_provider(self, model: str | None = None) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
