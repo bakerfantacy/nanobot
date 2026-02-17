@@ -164,63 +164,17 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
-    async def _run_agent_loop(self, msg: list[dict]) -> tuple[str | None, list[str]]:
+    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
         """
         Run the agent iteration loop.
 
         Args:
-            initial_messages: Starting messages for the LLM conversation.
+            initial_messages: Starting messages for the LLM conversation (from context.build_messages).
 
         Returns:
             Tuple of (final_content, list_of_tools_used).
         """
-        # Handle system messages (subagent announces)
-        # The chat_id contains the original "channel:chat_id" to route back to
-        if msg.channel == "system":
-            return await self._process_system_message(msg)
-
-        # Get or create session early (needed for relevance check when using group_policy=auto)
-        session = self.sessions.get_or_create(msg.session_key)
-
-        # Message routing: check if this agent should respond
-        if not await self.router.should_respond(msg, session):
-            logger.info(
-                f"Skipping message from {msg.channel}:{msg.sender_id} "
-                f"(not relevant / not mentioned)"
-            )
-            return None
-
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
-        
-        # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(msg.channel, msg.chat_id)
-        
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(msg.channel, msg.chat_id)
-        
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(msg.channel, msg.chat_id)
-        
-        # Collect scenario-specific additions from routing filters
-        prompt_extras = self.router.collect_prompt_extras(msg, session)
-        user_reminders = self.router.collect_user_reminders(msg, session)
-
-        # Build initial messages (use get_history for LLM-formatted messages)
-        messages = self.context.build_messages(
-            history=session.get_history(),
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            prompt_extras=prompt_extras,
-            user_reminders=user_reminders,
-        )
-        
+        messages = initial_messages
         # Agent loop
         iteration = 0
         final_content = None
@@ -329,7 +283,15 @@ class AgentLoop:
         
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
-        
+
+        # Message routing: check if this agent should respond (e.g. group_policy=mention)
+        if not await self.router.should_respond(msg, session):
+            logger.info(
+                f"Skipping message from {msg.channel}:{msg.sender_id} "
+                f"(not relevant / not mentioned)"
+            )
+            return None
+
         # Handle slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
@@ -355,12 +317,16 @@ class AgentLoop:
             asyncio.create_task(self._consolidate_memory(session))
 
         self._set_tool_context(msg.channel, msg.chat_id)
+        prompt_extras = self.router.collect_prompt_extras(msg, session)
+        user_reminders = self.router.collect_user_reminders(msg, session)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            prompt_extras=prompt_extras,
+            user_reminders=user_reminders,
         )
         final_content, tools_used = await self._run_agent_loop(initial_messages)
 

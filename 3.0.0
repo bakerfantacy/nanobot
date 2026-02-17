@@ -1,0 +1,9 @@
+Collecting prompt-toolkit
+  Using cached prompt_toolkit-3.0.52-py3-none-any.whl.metadata (6.4 kB)
+Collecting wcwidth (from prompt-toolkit)
+  Using cached wcwidth-0.6.0-py3-none-any.whl.metadata (30 kB)
+Using cached prompt_toolkit-3.0.52-py3-none-any.whl (391 kB)
+Using cached wcwidth-0.6.0-py3-none-any.whl (94 kB)
+Installing collected packages: wcwidth, prompt-toolkit
+
+Successfully installed prompt-toolkit-3.0.52 wcwidth-0.6.0
