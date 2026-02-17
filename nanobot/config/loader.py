@@ -102,6 +102,7 @@ def load_config(
     """
     Load configuration from file or create default.
 
+
     Args:
         config_path: Optional explicit path to config file.
         agent_name: Agent name used when config_path is not provided.
@@ -138,6 +139,7 @@ def save_config(
     """
     Save configuration to file.
 
+
     Args:
         config: Configuration to save.
         config_path: Optional explicit path. Uses agent default if not provided.
@@ -146,9 +148,7 @@ def save_config(
     path = config_path or get_config_path(agent_name)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Convert to camelCase format
-    data = config.model_dump()
-    data = convert_to_camel(data)
+    data = config.model_dump(by_alias=True)
 
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
