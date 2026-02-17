@@ -200,8 +200,9 @@ class AgentLoop:
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(msg.channel, msg.chat_id)
         
-        # Collect scenario-specific prompt additions (e.g. group member list)
+        # Collect scenario-specific additions from routing filters
         prompt_extras = self.router.collect_prompt_extras(msg, session)
+        user_reminders = self.router.collect_user_reminders(msg, session)
 
         # Build initial messages (use get_history for LLM-formatted messages)
         messages = self.context.build_messages(
@@ -211,6 +212,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             prompt_extras=prompt_extras,
+            user_reminders=user_reminders,
         )
         
         # Agent loop

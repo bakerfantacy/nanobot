@@ -1,50 +1,68 @@
-"""Message routing and scenario-specific prompt injection.
+"""Group-chat routing filter and prompt injection.
 
-This module isolates scenario-specific logic (group chat, bot-to-bot, etc.)
-away from the core agent loop and context builder.  Each scenario is
-encapsulated in a :class:`ResponseFilter` subclass that can independently:
-
-1. **Gate** messages — decide whether the agent should respond.
-2. **Enrich** the system prompt — inject scenario-specific instructions
-   (e.g. group member list, @mention rules) that the core modules don't
-   need to know about.
-
-Architecture
-------------
-MessageRouter
-  └── ResponseFilter (chain)
-        ├── GroupChatFilter   – group chat @mention / policy / LLM relevance
-        └── (future filters)  – e.g. rate-limit, DND, content-type …
+All group-chat-specific prompt text and routing logic lives in this file
+so that the core context builder and agent loop remain scenario-agnostic.
 """
 
 from __future__ import annotations
 
-import abc
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage
-from nanobot.session.manager import Session
 from nanobot.providers.base import LLMProvider
+from nanobot.session.manager import Session
+
+from nanobot.agent.routing.base import ResponseFilter
 
 # -----------------------------------------------------------------------
 # Prompt templates – group chat
-#
-# All group-chat-specific prompt text is maintained here so that the core
-# context builder and agent loop remain scenario-agnostic.
 # -----------------------------------------------------------------------
 
 # -- system-prompt additions (injected into the main LLM call) ----------
 
 _GROUP_MEMBERS_HEADER = "## Group Chat Members"
 
-_GROUP_MENTION_INSTRUCTIONS = (
-    "To @mention someone, write @name in your response{mention_hint}. "
-    "Don't mention other bots if you are responding to a message from user, "
-    "unless user allows you to do so. "
+# Mention rules injected into the system prompt.
+# Keyed by message source so the restriction strength can vary.
+
+_MENTION_RULES_FROM_USER = (
+    "**When the message @mentions multiple bots (including you), "
+    "ONLY respond to the part directed at YOU.** "
+    "Ignore instructions and questions meant for other bots entirely — "
+    "do not answer them, summarize them, or reference them in your response.\n\n"
+    "**Do NOT @mention other bots in your response** unless ALL of the following are true:\n"
+    "1. You need another bot to **execute a task** that you cannot do yourself.\n"
+    "2. Your **next step depends on** the result of that task.\n"
+    "3. There is no other way to obtain the result.\n\n"
+    "If you are unsure, do NOT @mention. Specifically:\n"
+    "- Do not @mention a bot just to ask its opinion or for general help.\n"
+    "- Do not answer on behalf of another bot, even if you know the answer.\n"
+    "- If the user's question involves another bot's expertise, "
+    "let the user decide whether to ask them.\n\n"
+    "Mention syntax: write @name in your response{mention_hint}. "
     "The system will convert it to a proper @mention automatically."
+)
+
+_MENTION_RULES_FROM_BOT = (
+    "You are replying to another bot. Keep your response focused on the task.\n"
+    "- Do NOT @mention additional bots unless the requesting bot explicitly "
+    "asked you to relay results to a specific bot by name.\n"
+    "- Avoid chain-summoning: if you can answer directly, just answer.\n\n"
+    "Mention syntax: write @name in your response{mention_hint}. "
+    "The system will convert it to a proper @mention automatically."
+)
+
+# -- user-message reminder (highest-attention position) -----------------
+
+_USER_REMINDER_GROUP = (
+    "[System] This is a group chat. "
+    "ONLY answer the part directed at you. "
+    "Do NOT answer for other bots. "
+    "Do NOT @mention other bots unless you need one to execute a task "
+    "and your next step depends on its result."
 )
 
 # -- routing LLM (lightweight yes/no call) ------------------------------
@@ -68,47 +86,7 @@ _GROUP_ROUTING_PROMPT = (
 
 
 # -----------------------------------------------------------------------
-# Base class
-# -----------------------------------------------------------------------
-
-class ResponseFilter(abc.ABC):
-    """Base class for scenario-specific message filters.
-
-    Subclasses implement two hooks:
-
-    * :meth:`should_respond` – gate (respond / skip / defer).
-    * :meth:`build_prompt_extras` – contribute extra text to the system
-      prompt so the LLM is aware of scenario-specific context.
-    """
-
-    @abc.abstractmethod
-    async def should_respond(
-        self, msg: InboundMessage, session: Session | None
-    ) -> bool | None:
-        """Decide whether the agent should respond.
-
-        Returns
-        -------
-        bool | None
-            * ``True``  – the agent **should** respond.
-            * ``False`` – the agent should **skip** this message.
-            * ``None``  – this filter has no opinion; defer to the next one.
-        """
-        ...
-
-    def build_prompt_extras(
-        self, msg: InboundMessage, session: Session | None
-    ) -> str | None:
-        """Return extra text to append to the system prompt.
-
-        Called **after** routing succeeds (i.e. the agent will respond).
-        Return ``None`` (the default) if there is nothing to add.
-        """
-        return None
-
-
-# -----------------------------------------------------------------------
-# Group chat filter
+# GroupChatFilter
 # -----------------------------------------------------------------------
 
 class GroupChatFilter(ResponseFilter):
@@ -140,12 +118,28 @@ class GroupChatFilter(ResponseFilter):
         self.bot_reply_llm_threshold = bot_reply_llm_threshold
         self.bot_reply_llm_check = bot_reply_llm_check
 
+    # -- user-message reminder -------------------------------------------
+
+    def build_user_reminder(
+        self, msg: InboundMessage, session: Session | None
+    ) -> str | None:
+        """Short reminder prepended to user message for maximum salience."""
+        meta = msg.metadata or {}
+        if meta.get("chat_type") != "group":
+            return None
+        return _USER_REMINDER_GROUP
+
     # -- prompt extras ---------------------------------------------------
 
     def build_prompt_extras(
         self, msg: InboundMessage, session: Session | None
     ) -> str | None:
-        """Inject group member list and @mention instructions into the system prompt."""
+        """Inject group member list and @mention rules into the system prompt.
+
+        The mention rules are tailored to the message source:
+        - From a human user → strict prohibition on @mentioning bots.
+        - From another bot  → limited, task-focused mention policy.
+        """
         meta = msg.metadata or {}
         if meta.get("chat_type") != "group":
             return None
@@ -172,10 +166,15 @@ class GroupChatFilter(ResponseFilter):
         members_text = "\n".join(member_lines)
         mention_hint = f" (e.g. @{first_bot_name})" if first_bot_name else ""
 
+        # Pick mention rules based on message source
+        from_bot = meta.get("from_bot", False)
+        rules_template = _MENTION_RULES_FROM_BOT if from_bot else _MENTION_RULES_FROM_USER
+        mention_rules = rules_template.format(mention_hint=mention_hint)
+
         return (
             f"\n\n{_GROUP_MEMBERS_HEADER}\n"
             f"Other members in this group chat:\n{members_text}\n\n"
-            + _GROUP_MENTION_INSTRUCTIONS.format(mention_hint=mention_hint)
+            f"{mention_rules}"
         )
 
     # -- routing ---------------------------------------------------------
@@ -191,28 +190,28 @@ class GroupChatFilter(ResponseFilter):
 
         from_bot = meta.get("from_bot", False)
         policy = meta.get("group_policy", "open")
+        # Set by channel (e.g. Feishu: only true when @ appears in message text)
+        # or by relay (from relayed message content). Default False.
+        is_mentioned = meta.get("is_mentioned", False)
 
         logger.debug("GroupChatFilter: evaluating rules …")
-        logger.debug(f"  from_bot={from_bot}, policy={policy}")
+        logger.debug(f"from_bot={from_bot}, policy={policy}")
 
         if from_bot:
             depth = session.count_trailing_bots() + 1 if session else 1
-            logger.debug(f"  bot depth={depth}")
+            logger.debug(f"bot depth={depth}")
+            logger.debug(f"is mentioned={is_mentioned}")
             if depth >= self.max_bot_reply_depth:
                 logger.debug(
                     f"  Skipping: depth {depth} >= max {self.max_bot_reply_depth}"
                 )
                 return False
-            if not meta.get("is_mentioned", False):
+            if not is_mentioned:
                 return False
-            if (
-                meta.get("is_mentioned", True)
-                and depth <= self.bot_reply_llm_threshold
-                or not self.bot_reply_llm_check
-            ):
+            if is_mentioned and depth <= self.bot_reply_llm_threshold:
                 return True  # within threshold – no LLM needed
         else:
-            if policy == "open" or meta.get("is_mentioned", True):
+            if policy == "open" or is_mentioned:
                 return True
 
         # Fall through → LLM judgment
@@ -341,47 +340,3 @@ class GroupChatFilter(ResponseFilter):
             label = f"{role}" + (f" ({sender})" if sender else "")
             lines.append(f"  {label}: {content}")
         return "\nRecent:\n" + "\n".join(lines) + "\n\n"
-
-
-# -----------------------------------------------------------------------
-# Router
-# -----------------------------------------------------------------------
-
-class MessageRouter:
-    """Chains :class:`ResponseFilter` instances to reach a respond/skip decision.
-
-    Filters are evaluated **in order**.  The first filter that returns a
-    definitive ``True`` or ``False`` wins.  If every filter returns ``None``
-    the router defaults to **respond** (``True``).
-    """
-
-    def __init__(self) -> None:
-        self._filters: list[ResponseFilter] = []
-
-    def add_filter(self, f: ResponseFilter) -> None:
-        """Append a filter to the chain."""
-        self._filters.append(f)
-
-    async def should_respond(
-        self, msg: InboundMessage, session: Session | None = None
-    ) -> bool:
-        for f in self._filters:
-            result = await f.should_respond(msg, session)
-            if result is not None:
-                return result
-        return True  # default: respond
-
-    def collect_prompt_extras(
-        self, msg: InboundMessage, session: Session | None = None
-    ) -> list[str]:
-        """Gather system-prompt additions from all filters.
-
-        Called after :meth:`should_respond` returns ``True`` so each filter
-        can inject scenario-specific instructions into the main LLM call.
-        """
-        extras: list[str] = []
-        for f in self._filters:
-            extra = f.build_prompt_extras(msg, session)
-            if extra:
-                extras.append(extra)
-        return extras

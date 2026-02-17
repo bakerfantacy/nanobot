@@ -103,8 +103,12 @@ IMPORTANT: When responding to direct questions or conversations, reply directly 
 Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 For normal conversation, just respond with text - do not call the message tool.
 
-Always be helpful, accurate, and concise. 
-The answers should be simple and direct. Just give the conclusion.
+## Reply style (strict)
+- Be brief: one short paragraph or 1–3 sentences for most questions. Only go longer if the user clearly needs detail.
+- No AI fluff: avoid "好的"、"当然"、"很高兴为您"、"让我来"、"总结一下" and long bullet lists. Say the thing directly.
+- Sound human: casual, natural language like chatting with a friend. No "首先/其次/综上所述" unless the topic really needs it.
+- No reasoning in the reply: give the conclusion only. Do not show thinking or step-by-step unless asked.
+- Tools: one short line of what you're doing. When remembering, write to {workspace_path}/memory/MEMORY.md
 Don’t show your reasoning or write long explanations unless the user asks for them.
 When using tools, explain what you're doing.
 When remembering something, write to {workspace_path}/memory/MEMORY.md"""
@@ -130,6 +134,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         channel: str | None = None,
         chat_id: str | None = None,
         prompt_extras: list[str] | None = None,
+        user_reminders: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -143,6 +148,8 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             chat_id: Current chat/user ID.
             prompt_extras: Optional scenario-specific text sections to
                 append to the system prompt (provided by MessageRouter).
+            user_reminders: Optional short reminders prepended to the user
+                message for maximum LLM attention (provided by MessageRouter).
 
         Returns:
             List of messages including system prompt.
@@ -163,8 +170,14 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         # History
         messages.extend(history)
 
+        # Prepend reminders to user message for highest salience
+        effective_message = current_message
+        if user_reminders:
+            reminder_block = "\n".join(user_reminders)
+            effective_message = f"{reminder_block}\n\n{current_message}"
+
         # Current message (with optional image attachments)
-        user_content = self._build_user_content(current_message, media)
+        user_content = self._build_user_content(effective_message, media)
         messages.append({"role": "user", "content": user_content})
 
         return messages

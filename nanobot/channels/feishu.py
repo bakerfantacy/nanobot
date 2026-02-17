@@ -427,6 +427,7 @@ class FeishuChannel(BaseChannel):
             mentions = getattr(message, "mentions", None) or []
             mentioned_ids: set[str] = set()
             mention_names: dict[str, str] = {}  # placeholder → display name
+            our_mention_key: str | None = None  # placeholder for this bot (e.g. _user_1)
             for m in mentions:
                 # m.id is typically a UserId object with .open_id; fall back to str
                 m_id_obj = getattr(m, "id", None)
@@ -439,8 +440,37 @@ class FeishuChannel(BaseChannel):
                 name = getattr(m, "name", "")
                 if key and name:
                     mention_names[key] = name
+                if open_id and open_id == self._bot_open_id and key:
+                    our_mention_key = key
 
-            is_mentioned = bool(self._bot_open_id and self._bot_open_id in mentioned_ids)
+            # Require explicit @ in message text. Feishu can add us to mentions
+            # when user "replies" to our message without typing @us; only treat
+            # as mentioned when the message body actually contains a mention of us.
+            raw_text = ""
+            if msg_type == "text":
+                try:
+                    raw_text = json.loads(message.content).get("text", "") or ""
+                except (json.JSONDecodeError, AttributeError):
+                    raw_text = getattr(message, "content", "") or ""
+            # Only treat as mentioned when our placeholder appears in message text
+            # (e.g. @_user_1 or _user_1). Do not trust mentions list alone for *text*
+            # messages. For non-text messages (e.g. image-only), there is no text body
+            # to contain the placeholder; if we are in mentions and have our_mention_key,
+            # the user did @ us, so treat as mentioned.
+            if msg_type == "text":
+                in_text = bool(
+                    our_mention_key
+                    and raw_text
+                    and (our_mention_key in raw_text or f"@{our_mention_key}" in raw_text)
+                )
+            else:
+                in_text = bool(our_mention_key and self._bot_open_id and self._bot_open_id in mentioned_ids)
+            is_mentioned = bool(self._bot_open_id and self._bot_open_id in mentioned_ids and in_text)
+            if chat_type == "group" and self._bot_open_id:
+                logger.debug(
+                    f"is_mentioned: in_list={self._bot_open_id in mentioned_ids} "
+                    f"our_key={our_mention_key!r} in_text={in_text} => {is_mentioned}"
+                )
 
             # ----------------------------------------------------------
             # Group routing (applies to all senders: user or other bot)
@@ -462,10 +492,7 @@ class FeishuChannel(BaseChannel):
             # Parse message content
             # ----------------------------------------------------------
             if msg_type == "text":
-                try:
-                    content = json.loads(message.content).get("text", "")
-                except json.JSONDecodeError:
-                    content = message.content or ""
+                content = raw_text if raw_text else ""
             else:
                 content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
 

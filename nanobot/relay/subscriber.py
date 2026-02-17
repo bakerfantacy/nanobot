@@ -98,8 +98,11 @@ class RelaySubscriber:
         metadata["from_bot"] = True
         metadata["sender_agent_name"] = sender_agent_name
         metadata["chat_type"] = metadata.get("chat_type") or "group"
-        if "is_mentioned" not in metadata:
-            metadata["is_mentioned"] = self._compute_is_mentioned(content)
+        # Always derive is_mentioned from this message's content only. Do not trust
+        # payload metadata (it may be copied from the original user message when
+        # the sending bot replied, so e.g. BotB would see is_mentioned=True from
+        # the user's @ even though the sending bot's reply did not @ BotB).
+        metadata["is_mentioned"] = self._compute_is_mentioned(content)
         if "group_policy" not in metadata:
             metadata["group_policy"] = "auto"
 
